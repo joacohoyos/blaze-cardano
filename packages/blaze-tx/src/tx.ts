@@ -60,7 +60,7 @@ import {
 } from "@blaze-cardano/core";
 import * as value from "./value";
 import { micahsSelector, type SelectionResult } from "./coinSelection";
-import { calculateReferenceScriptFee } from "./utils";
+import { calculateReferenceScriptFee, isValueSizeValid } from "./utils";
 
 /*
 methods we want to implement somewhere in new blaze (from haskell codebase):
@@ -111,7 +111,7 @@ export class TxBuilder {
   private changeAddress?: Address; // The address to send change to, if any.
   private rewardAddress?: Address; // The reward address to delegate from, if any.
   private networkId?: NetworkId; // The network ID for the transaction.
-  private changeOutputIndex?: number; // The index of the change output in the transaction.
+  private changeOutputIndexes: number[]; // The index of the change output in the transaction.
   private plutusData: TransactionWitnessPlutusData = new Set(); // A set of Plutus data for witness purposes.
   private requiredWitnesses: Set<Ed25519PublicKeyHex> = new Set(); // A set of public keys required for witnessing the transaction.
   private requiredNativeScripts: Set<Hash28ByteBase16> = new Set(); // A set of native script hashes required by the transaction.
@@ -554,8 +554,7 @@ export class TxBuilder {
     ) {
       throw new Error("addOutput: Failed due to min ada!");
     }
-    const valueByteLength = output.amount().toCbor().length / 2;
-    if (valueByteLength > this.params.maxValueSize) {
+    if (!isValueSizeValid(output.amount(), this.params, 1)) {
       throw new Error("addOutput: Failed due to max value size!");
     }
     return output;
@@ -960,10 +959,12 @@ export class TxBuilder {
     if (spareAmount != 0n) {
       return value.merge(tilt, new Value(-spareAmount)); // Subtract 5 ADA from the excess.
     }
-    return value.merge(
-      tilt,
-      this.body.outputs()[this.changeOutputIndex!]!.amount(),
-    );
+    //TODO: reduce
+    let finalTilt = tilt;
+    this.changeOutputIndexes.forEach((index) => {
+      finalTilt = value.merge(finalTilt, this.body.outputs()[index]!.amount());
+    });
+    return finalTilt;
   }
 
   private balanced() {
@@ -1130,17 +1131,73 @@ export class TxBuilder {
       excessValue.setMultiasset(tokenMap);
     }
     // Create a new transaction output with the change address and the adjusted excess value.
-    const output = new TransactionOutput(this.changeAddress!, excessValue);
+    const outputs: TransactionOutput[] = [];
+    let tokenSize = excessValue.multiasset()?.size || 0;
+    let excessCoin = excessValue.coin();
+    while (tokenSize > 0) {
+      const { val, excess } = this.getValidSizeValueWithExcess(excessValue);
+      const output = this.checkAndAlterOutput(
+        new TransactionOutput(this.changeAddress!, val),
+      );
+      outputs.push(output);
+      tokenSize = excess.multiasset()?.size || 0;
+      excessCoin = excess.coin() - output.amount().coin();
+    }
+    const lastOutput = outputs.pop();
+    const extraCoin = excessCoin > 0n ? excessCoin : 0n;
+    if (lastOutput) {
+      const amount = lastOutput.amount();
+      amount.setCoin(amount.coin() + extraCoin);
+      outputs.push(
+        this.checkAndAlterOutput(
+          new TransactionOutput(this.changeAddress!, amount),
+        ),
+      );
+    } else {
+      const changeValue = new Value(extraCoin);
+      outputs.push(
+        this.checkAndAlterOutput(
+          new TransactionOutput(this.changeAddress!, changeValue),
+        ),
+      );
+    }
+
+    outputs.forEach((output, index) => {
+      if (this.changeOutputIndexes[index] !== undefined) {
+        const outputs = this.body.outputs();
+        outputs[this.changeOutputIndexes[index]!] = output;
+        this.body.setOutputs(outputs);
+      } else {
+        this.addOutput(output);
+        this.changeOutputIndexes.push(this.outputsCount - 1);
+      }
+    });
     // If there is no existing change output index, add the new output to the transaction
     // and store its index. Otherwise, update the existing change output with the new output.
-    if (undefined === this.changeOutputIndex) {
-      this.addOutput(output);
-      this.changeOutputIndex = this.outputsCount - 1;
-    } else {
-      const outputs = this.body.outputs();
-      outputs[this.changeOutputIndex] = this.checkAndAlterOutput(output);
-      this.body.setOutputs(outputs);
+  }
+
+  private getValidSizeValueWithExcess(v: Value): { val: Value; excess: Value } {
+    let val = new Value(0n);
+    let excess = Value.fromCbor(v.toCbor());
+    while (excess.multiasset()?.size! > 0) {
+      const tokenIter = excess.multiasset()?.keys().next();
+      const token = tokenIter?.value;
+      if (token?.done && !token) break;
+      const currMap: TokenMap = val.multiasset() ?? new Map();
+      const currTokenValue = currMap.get(token) ?? 0n;
+      const excessTokenAmount = excess.multiasset()?.get(token) ?? 0n;
+      currMap.set(token, currTokenValue + excessTokenAmount);
+      const oldValue = value.merge(val, value.zero());
+      val.setMultiasset(currMap);
+      if (!isValueSizeValid(val, this.params, 0.9)) {
+        return { val: oldValue, excess };
+      }
+      excess = value.sub(
+        excess,
+        new Value(0n, new Map([[token, excessTokenAmount]])),
+      );
     }
+    return { val, excess };
   }
 
   /**
@@ -1334,7 +1391,11 @@ export class TxBuilder {
       return;
     }
     // Retrieve available UTXOs within scope.
-    const scope = [...this.utxoScope.values()];
+    console.log("FUCK YOUUU");
+    const scope = [
+      ...this.utxoScope.values(),
+      ...this.collateralUtxos.values(),
+    ];
     // Calculate the total collateral based on the transaction fee and collateral percentage.
     const totalCollateral = BigInt(
       Math.ceil(
@@ -1457,7 +1518,7 @@ export class TxBuilder {
     // Balance the change output with the updated excess value.
     this.balanceChange(excessValue);
     // Ensure a change output index has been set after balancing.
-    if (this.changeOutputIndex === undefined) {
+    if (this.changeOutputIndexes.length === 0) {
       throw new Error(
         "Unreachable! Somehow change balancing succeeded but still failed.",
       );
@@ -1488,7 +1549,6 @@ export class TxBuilder {
         );
       }
     }
-    this.balanceChange(excessValue);
     // Create a draft transaction for fee calculation.
     const draft_tx = new Transaction(this.body, tw, auxiliaryData);
     // Calculate and set the transaction fee.

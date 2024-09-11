@@ -1,5 +1,6 @@
 import {
   CborReader,
+  Value,
   type ProtocolParameters,
   type Script,
 } from "@blaze-cardano/core";
@@ -45,4 +46,21 @@ export function calculateReferenceScriptFee(
   }
 
   return refFee;
+}
+
+/**
+ * Checks if the size of the value is within the maximum value size limit.
+ * Supports a padding factor to allow for safe margin when calculating the size of the value.
+ * @param {Value} value - The value to check.
+ * @param {ProtocolParameters} params - The protocol parameters.
+ * @param {number} paddingPercentage - The padding factor to apply to the value size. Between 0 and 1.
+ * @returns {boolean} True if the value size is within the maximum value size limit, false otherwise.
+ */
+export function isValueSizeValid(
+  value: Value,
+  params: ProtocolParameters,
+  paddingPercentage: number,
+): boolean {
+  const valueByteLength = value.toCbor().length / 2;
+  return valueByteLength <= params.maxValueSize * paddingPercentage;
 }
