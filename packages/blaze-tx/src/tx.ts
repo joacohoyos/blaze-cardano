@@ -1398,7 +1398,11 @@ export class TxBuilder {
       .collateral()!
       .values()
       .reduce((acc, input) => {
-        const utxo = scope.find((x) => x.input() == input);
+        const utxo = scope.find(
+          (x) =>
+            x.input().transactionId() === input.transactionId() &&
+            x.input().index() === input.index(),
+        );
         if (!utxo) {
           throw new Error(
             "balanceCollateralChange: Could not resolve some collateral input",
