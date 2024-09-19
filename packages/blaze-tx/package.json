@@ -40,6 +40,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@blaze-cardano/vm": "workspace:*",
     "@blaze-cardano/core": "workspace:*"
   }
 }

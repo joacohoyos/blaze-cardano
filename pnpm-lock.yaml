@@ -324,6 +324,9 @@ importers:
       '@blaze-cardano/core':
         specifier: workspace:*
         version: link:../blaze-core
+      '@blaze-cardano/vm':
+        specifier: workspace:*
+        version: link:../blaze-vm
     devDependencies:
       '@blaze-cardano/eslint-config':
         specifier: workspace:*
